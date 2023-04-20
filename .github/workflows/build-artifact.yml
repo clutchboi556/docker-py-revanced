@@ -22,24 +22,33 @@ on:
         type: boolean
         required: false
         default: false
+      DEBUG_ENABLED:
+        type: boolean
+        description: 'Run the build with tmate debugging enabled.'
+        required: false
+        default: false
 
 jobs:
   build-apk:
     name: APK Build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v3.1.0
+        uses: actions/checkout@v3.5.0
 
       - name: Update Env for custom build
         run: |
           echo "${{ secrets.ENVS }}" >> .env
 
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.DEBUG_ENABLED }}
+
       - name: Build Revanced APKs
         run: |
-          docker-compose up
+          docker-compose up --build
 
       - name: Upload Build APKS
         uses: nikhilbadyal/upload-artifact@count-check

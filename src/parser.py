@@ -49,16 +49,26 @@ class Parser(object):
         """
         return self._PATCHES
 
-    def invert_patch(self, name: str) -> None:
+    def invert_patch(self, name: str) -> bool:
         """
         Getter to get all excluded patches
         :return: List of excluded patches
         """
-        patch_index = self._PATCHES.index(name)
-        if self._PATCHES[patch_index - 1] == "-e":
-            self._PATCHES[patch_index - 1] = "-i"
-        else:
-            self._PATCHES[patch_index - 1] = "-e"
+        try:
+            patch_index = self._PATCHES.index(name)
+            if self._PATCHES[patch_index - 1] == "-e":
+                self._PATCHES[patch_index - 1] = "-i"
+            else:
+                self._PATCHES[patch_index - 1] = "-e"
+            return True
+        except ValueError:
+            return False
+
+    def exclude_all_patches(self) -> None:
+        """Exclude all patches to Speed up CI."""
+        for idx, item in enumerate(self._PATCHES):
+            if item == "-i":
+                self._PATCHES[idx] = "-e"
 
     # noinspection IncorrectFormatting
     def patch_app(
@@ -96,12 +106,15 @@ class Parser(object):
             f"Re-{app}-{version}{output_prefix}output.apk",
             "--keystore",
             self.config.keystore_name,
+            "--options",
+            "options.toml",
         ]
         if is_experimental:
             logger.debug("Using experimental features")
             args.append("--experimental")
         args[1::2] = map(lambda i: self.config.temp_folder.joinpath(i), args[1::2])
-
+        if self.config.ci_test:
+            self.exclude_all_patches()
         if self._PATCHES:
             args.extend(self._PATCHES)
         if (

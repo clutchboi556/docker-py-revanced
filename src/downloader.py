@@ -13,25 +13,38 @@ from selectolax.lexbor import LexborHTMLParser
 from tqdm import tqdm
 
 from src.config import RevancedConfig
-from src.utils import update_changelog
+from src.patches import Patches
+from src.utils import AppNotFound, handle_response, update_changelog
 
 
 class Downloader(object):
     """Files downloader."""
 
-    def __init__(self, config: RevancedConfig):
+    def __init__(self, patcher: Patches, config: RevancedConfig):
         self._CHUNK_SIZE = 10485760
         self._QUEUE: PriorityQueue[Tuple[float, str]] = PriorityQueue()
         self._QUEUE_LENGTH = 0
         self.config = config
         self.download_revanced()
+        self.patcher = patcher
 
     def _download(self, url: str, file_name: str) -> None:
         logger.debug(f"Trying to download {file_name} from {url}")
         self._QUEUE_LENGTH += 1
         start = perf_counter()
-        resp = self.config.session.get(url, stream=True)
-        total = int(resp.headers.get("content-length", 0))
+        headers = {}
+        if self.config.personal_access_token and "github" in url:
+            logger.debug("Using personal access token")
+            headers.update(
+                {"Authorization": "token " + self.config.personal_access_token}
+            )
+        response = self.config.session.get(
+            url,
+            stream=True,
+            headers=headers,
+        )
+        handle_response(response)
+        total = int(response.headers.get("content-length", 0))
         bar = tqdm(
             desc=file_name,
             total=total,
@@ -41,7 +54,7 @@ class Downloader(object):
             colour="green",
         )
         with self.config.temp_folder.joinpath(file_name).open("wb") as dl_file, bar:
-            for chunk in resp.iter_content(self._CHUNK_SIZE):
+            for chunk in response.iter_content(self._CHUNK_SIZE):
                 size = dl_file.write(chunk)
                 bar.update(size)
         self._QUEUE.put((perf_counter() - start, file_name))
@@ -77,7 +90,12 @@ class Downloader(object):
         apm = parser.css(".apkm-badge")
         sub_url = ""
         for is_apm in apm:
-            if "APK" in is_apm.text():
+            parent_text = is_apm.parent.parent.text()
+            if "APK" in is_apm.text() and (
+                "arm64-v8a" in parent_text
+                or "universal" in parent_text
+                or "noarch" in parent_text
+            ):
                 parser = is_apm.parent
                 sub_url = parser.css_first(".accent_color").attributes["href"]
                 break
@@ -90,14 +108,45 @@ class Downloader(object):
         return download_url
 
     def __upto_down_downloader(self, app: str) -> str:
-        page = "https://spotify.en.uptodown.com/android/download"
+        page = f"https://{app}.en.uptodown.com/android/download"
         parser = LexborHTMLParser(self.config.session.get(page).text)
         main_page = parser.css_first("#detail-download-button")
         download_url = main_page.attributes["data-url"]
         app_version: str = parser.css_first(".version").text()
-        self._download(download_url, "spotify.apk")
-        logger.debug(f"Downloaded {app} apk from apkmirror_specific_version in rt")
+        self._download(download_url, f"{app}.apk")
+        logger.debug(f"Downloaded {app} apk from upto_down_downloader in rt")
         return app_version
+
+    def __apk_pure_downloader(self, app: str) -> str:
+        package_name = None
+        for package, app_tuple in self.patcher.revanced_app_ids.items():
+            if app_tuple[0] == app:
+                package_name = package
+        if not package_name:
+            logger.info("Unable to download from apkpure")
+            raise AppNotFound()
+        download_url = f"https://d.apkpure.com/b/APK/{package_name}?version=latest"
+        self._download(download_url, f"{app}.apk")
+        logger.debug(f"Downloaded {app} apk from apk_pure_downloader in rt")
+        return "latest"
+
+    def __apk_sos_downloader(self, app: str) -> str:
+        package_name = None
+        for package, app_tuple in self.patcher.revanced_app_ids.items():
+            if app_tuple[0] == app:
+                package_name = package
+        if not package_name:
+            logger.info("Unable to download from apkcombo")
+            raise AppNotFound()
+        download_url = f"https://apksos.com/download-app/{package_name}"
+        parser = LexborHTMLParser(self.config.session.get(download_url).text)
+        download_url = parser.css_first(
+            r"body > div > div > div > div > div.col-sm-12.col-md-8 > div.card.fluid.\.idma > "
+            "div.section.row > div.col-sm-12.col-md-8.text-center > p > a"
+        ).attributes["href"]
+        self._download(download_url, f"{app}.apk")
+        logger.debug(f"Downloaded {app} apk from apk_combo_downloader in rt")
+        return "latest"
 
     def apkmirror_specific_version(self, app: str, version: str) -> str:
         """Function to download the specified version of app from  apkmirror.
@@ -128,13 +177,17 @@ class Downloader(object):
             logger.debug("Invalid app")
             sys.exit(1)
         parser = LexborHTMLParser(self.config.session.get(page).text)
-        main_page = parser.css_first(".appRowVariantTag>.accent_color").attributes[
-            "href"
-        ]
+        try:
+            main_page = parser.css_first(".appRowVariantTag>.accent_color").attributes[
+                "href"
+            ]
+        except AttributeError:
+            # Handles a case when variants are not available
+            main_page = parser.css_first(".downloadLink").attributes["href"]
         match = re.search(r"\d", main_page)
         if not match:
             logger.error("Cannot find app main page")
-            sys.exit(-1)
+            raise AppNotFound()
         int_version = match.start()
         extra_release = main_page.rfind("release") - 1
         version: str = main_page[int_version:extra_release]
@@ -155,14 +208,21 @@ class Downloader(object):
         """
         logger.debug(f"Trying to download {name} from github")
         repo_url = f"https://api.github.com/repos/{owner}/{name}/releases/latest"
-        r = requests.get(
-            repo_url, headers={"Content-Type": "application/vnd.github.v3+json"}
-        )
+        headers = {
+            "Content-Type": "application/vnd.github.v3+json",
+        }
+        if self.config.personal_access_token:
+            logger.debug("Using personal access token")
+            headers.update(
+                {"Authorization": "token " + self.config.personal_access_token}
+            )
+        response = requests.get(repo_url, headers=headers)
+        handle_response(response)
         if name == "revanced-patches":
-            download_url = r.json()["assets"][1]["browser_download_url"]
+            download_url = response.json()["assets"][1]["browser_download_url"]
         else:
-            download_url = r.json()["assets"][0]["browser_download_url"]
-        update_changelog(f"{owner}/{name}", r.json())
+            download_url = response.json()["assets"][0]["browser_download_url"]
+        update_changelog(f"{owner}/{name}", response.json())
         self._download(download_url, file_name=file_name)
 
     def download_revanced(self) -> None:
@@ -197,6 +257,14 @@ class Downloader(object):
         """
         return self.__upto_down_downloader(app)
 
+    def apk_pure_downloader(self, app: str) -> str:
+        """Function to download from Apk Pure.
+
+        :param app: Name of the application
+        :return: Version of downloaded APK
+        """
+        return self.__apk_pure_downloader(app)
+
     def download_from_apkmirror(self, version: str, app: str) -> str:
         """Function to download from apkmirror.
 
@@ -209,14 +277,30 @@ class Downloader(object):
         else:
             return self.apkmirror_latest_version(app)
 
+    def apk_sos_downloader(self, app: str) -> str:
+        """Function to download from Apk Pure.
+
+        :param app: Name of the application
+        :return: Version of downloaded APK
+        """
+        return self.__apk_sos_downloader(app)
+
     def download_apk_to_patch(self, version: str, app: str) -> str:
         """Public function to download apk to patch.
 
         :param version: version to download
         :param app: App to download
-        :return: Version of apk
+        :return: Version of apk.
         """
+        if app in self.config.existing_downloaded_apks:
+            logger.debug("Will not download apk from the internet as it already exist.")
+            # Returning Latest as I don't know, which version user provided.
+            return "latest"
         if app in self.config.upto_down:
             return self.upto_down_downloader(app)
+        elif app in self.config.apk_pure:
+            return self.apk_pure_downloader(app)
+        elif app in self.config.apk_sos:
+            return self.apk_sos_downloader(app)
         else:
             return self.download_from_apkmirror(version, app)

@@ -4,3 +4,6 @@
 venv
 */__pycache__*
 *.pyc
+/revanced-cache/
+changelog.md
+.idea

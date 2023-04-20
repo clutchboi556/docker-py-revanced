@@ -7,6 +7,11 @@ on:
     paths:
       - '**.py'
       - 'README.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dockerhub-push:
     uses: nikhilbadyal/ghactions/.github/workflows/dockerhub-push.yml@main
@@ -14,8 +19,3 @@ jobs:
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-  cleanup:
-    name: GitHub Cleanup
-    uses: nikhilbadyal/ghactions/.github/workflows/github-cleanup.yml@main
-    secrets:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
